@@ -2649,21 +2649,22 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       grantData.expiresAt = expiresAt;
     }
 
-    // Save the updated grant with TTL matching refresh token expiration (if any)
-    await this.saveGrantWithTTL(env, grantKey, grantData, now);
-
-    // Create and store access token with potentially narrowed scopes
-    const accessToken = await this.createAccessToken({
-      userId,
-      grantId,
-      clientId: grantData.clientId,
-      scope: tokenScopes,
-      encryptedProps: encryptedAccessTokenProps,
-      encryptionKey: accessTokenEncryptionKey,
-      expiresIn: accessTokenTTL,
-      audience,
-      env,
-    });
+    // Save the updated grant with TTL matching refresh token expiration (if any) and create and
+    // store the access token with potentially narrowed scopes. The two writes are independent.
+    const [, accessToken] = await settleIndependentWrites(
+      this.saveGrantWithTTL(env, grantKey, grantData, now),
+      this.createAccessToken({
+        userId,
+        grantId,
+        clientId: grantData.clientId,
+        scope: tokenScopes,
+        encryptedProps: encryptedAccessTokenProps,
+        encryptionKey: accessTokenEncryptionKey,
+        expiresIn: accessTokenTTL,
+        audience,
+        env,
+      })
+    );
 
     // Build the response
     const tokenResponse: TokenResponse = {
@@ -2927,9 +2928,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     grantData.refreshTokenId = newRefreshTokenId;
     grantData.refreshTokenWrappedKey = newRefreshTokenWrappedKey;
 
-    // Save the updated grant with TTL if applicable
-    await this.saveGrantWithTTL(env, grantKey, grantData, now);
-
     // Store new access token with denormalized grant information
     const accessTokenData: Token = {
       id: accessTokenId,
@@ -2947,15 +2945,21 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       },
     };
 
-    // Save access token with TTL (using the potentially callback-provided TTL)
-    try {
-      await env.OAUTH_KV.put(`token:${userId}:${grantId}:${accessTokenId}`, JSON.stringify(accessTokenData), {
-        expirationTtl: accessTokenTTL,
-      });
-    } catch (error) {
-      this.throwRetryableTokenStorageErrorIfKvRateLimited(error);
-      throw error;
-    }
+    // Save the updated grant with TTL if applicable and the access token with TTL (using the
+    // potentially callback-provided TTL). The two writes are independent.
+    await settleIndependentWrites(
+      this.saveGrantWithTTL(env, grantKey, grantData, now),
+      (async () => {
+        try {
+          await env.OAUTH_KV.put(`token:${userId}:${grantId}:${accessTokenId}`, JSON.stringify(accessTokenData), {
+            expirationTtl: accessTokenTTL,
+          });
+        } catch (error) {
+          this.throwRetryableTokenStorageErrorIfKvRateLimited(error);
+          throw error;
+        }
+      })()
+    );
 
     // Build the response
     const tokenResponse: TokenResponse = {
@@ -4735,6 +4739,21 @@ export function resourceMatches(requested: string, granted: string, originOnly: 
  * @param secret - The secret value to hash
  * @returns A hex string representation of the hash
  */
+/**
+ * Runs a grant write and an access-token write concurrently. A grant write error is thrown as soon
+ * as it happens and takes precedence over an access-token write error, as when they ran in sequence.
+ */
+async function settleIndependentWrites<T>(grantWrite: Promise<void>, tokenWrite: Promise<T>): Promise<[void, T]> {
+  const tokenResult = tokenWrite.then(
+    (value) => ({ ok: true as const, value }),
+    (error: unknown) => ({ ok: false as const, error })
+  );
+  await grantWrite;
+  const result = await tokenResult;
+  if (!result.ok) throw result.error;
+  return [undefined, result.value];
+}
+
 async function hashSecret(secret: string): Promise<string> {
   // Use the same approach as generateTokenId for consistency
   return generateTokenId(secret);
