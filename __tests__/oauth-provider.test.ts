@@ -3587,12 +3587,14 @@ describe('OAuthProvider', () => {
       const started: string[] = [];
       let releaseWrites!: () => void;
       const writesReleased = new Promise<void>((resolve) => (releaseWrites = resolve));
-      mockEnv.OAUTH_KV.put = vi.fn(async (key: string, value: string | ArrayBuffer, options?: any) => {
-        started.push(key.split(':')[0]);
-        if (started.length === 2) releaseWrites();
-        await writesReleased;
-        return originalPut(key, value, options);
-      });
+      mockEnv.OAUTH_KV.put = vi.fn(
+        async (key: string, value: string | ArrayBuffer, options?: { expirationTtl?: number; expiration?: number }) => {
+          started.push(key.split(':')[0]);
+          if (started.length === 2) releaseWrites();
+          await writesReleased;
+          return originalPut(key, value, options);
+        }
+      );
 
       const params = new URLSearchParams();
       params.append('grant_type', 'refresh_token');
@@ -3616,17 +3618,21 @@ describe('OAuthProvider', () => {
     });
 
     it('should surface the refresh grant write error before the access-token write error', async () => {
+      let tokenWriteAttempted = false;
       const originalPut = mockEnv.OAUTH_KV.put.bind(mockEnv.OAUTH_KV);
-      mockEnv.OAUTH_KV.put = vi.fn(async (key: string, value: string | ArrayBuffer, options?: any) => {
-        if (key.startsWith('grant:')) {
-          await Promise.resolve();
-          throw new Error('KV PUT failed: grant write');
+      mockEnv.OAUTH_KV.put = vi.fn(
+        async (key: string, value: string | ArrayBuffer, options?: { expirationTtl?: number; expiration?: number }) => {
+          if (key.startsWith('grant:')) {
+            await Promise.resolve();
+            throw new Error('KV PUT failed: grant write');
+          }
+          if (key.startsWith('token:')) {
+            tokenWriteAttempted = true;
+            throw new Error('KV PUT failed: 429 Too Many Requests');
+          }
+          return originalPut(key, value, options);
         }
-        if (key.startsWith('token:')) {
-          throw new Error('KV PUT failed: 429 Too Many Requests');
-        }
-        return originalPut(key, value, options);
-      });
+      );
 
       const params = new URLSearchParams();
       params.append('grant_type', 'refresh_token');
@@ -3642,6 +3648,36 @@ describe('OAuthProvider', () => {
       );
 
       await expect(oauthProvider.fetch(refreshRequest, mockEnv, mockCtx)).rejects.toThrow('KV PUT failed: grant write');
+      expect(tokenWriteAttempted).toBe(true);
+    });
+
+    it('should surface the refresh grant write error without waiting for the access-token write', async () => {
+      const originalPut = mockEnv.OAUTH_KV.put.bind(mockEnv.OAUTH_KV);
+      let releaseTokenWrite!: () => void;
+      const tokenWriteReleased = new Promise<void>((resolve) => (releaseTokenWrite = resolve));
+      mockEnv.OAUTH_KV.put = vi.fn(
+        async (key: string, value: string | ArrayBuffer, options?: { expirationTtl?: number; expiration?: number }) => {
+          if (key.startsWith('grant:')) throw new Error('KV PUT failed: grant write');
+          if (key.startsWith('token:')) await tokenWriteReleased;
+          return originalPut(key, value, options);
+        }
+      );
+
+      const params = new URLSearchParams();
+      params.append('grant_type', 'refresh_token');
+      params.append('refresh_token', refreshToken);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+
+      const refreshRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+
+      await expect(oauthProvider.fetch(refreshRequest, mockEnv, mockCtx)).rejects.toThrow('KV PUT failed: grant write');
+      releaseTokenWrite();
     });
 
     it('should allow using the previous refresh token once', async () => {

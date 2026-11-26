@@ -4740,14 +4740,18 @@ export function resourceMatches(requested: string, granted: string, originOnly: 
  * @returns A hex string representation of the hash
  */
 /**
- * Runs a grant write and an access-token write concurrently, waits for both to settle, then
- * throws the grant write's error first, matching the precedence of writing them in sequence.
+ * Runs a grant write and an access-token write concurrently. A grant write error is thrown as soon
+ * as it happens and takes precedence over an access-token write error, as when they ran in sequence.
  */
 async function settleIndependentWrites<T>(grantWrite: Promise<void>, tokenWrite: Promise<T>): Promise<[void, T]> {
-  const [grantResult, tokenResult] = await Promise.allSettled([grantWrite, tokenWrite]);
-  if (grantResult.status === 'rejected') throw grantResult.reason;
-  if (tokenResult.status === 'rejected') throw tokenResult.reason;
-  return [undefined, tokenResult.value];
+  const tokenResult = tokenWrite.then(
+    (value) => ({ ok: true as const, value }),
+    (error: unknown) => ({ ok: false as const, error })
+  );
+  await grantWrite;
+  const result = await tokenResult;
+  if (!result.ok) throw result.error;
+  return [undefined, result.value];
 }
 
 async function hashSecret(secret: string): Promise<string> {
